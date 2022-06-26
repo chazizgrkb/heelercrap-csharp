@@ -8,8 +8,8 @@ using NetCoreServer;
 namespace MsnpServer
 {
 
-    class MsnpSession : TcpSession
-    {
+    class MsnpSession : TcpSession {
+    
         public MsnpSession msnpSession;
 
         // put any client variables shit here, putting them in OnReceived will redefine them.
@@ -20,6 +20,8 @@ namespace MsnpServer
         public object Email { get; private set; } // The current email of the client, inputted via the login prompt.
         public object ClientVersion { get; private set; } // The messenger version of the client
         public object SessionID { get; private set; } // The number of the session, what the fuck.
+        public object ConnectTimeStamp { get; private set; } // The timestamp of the session's connection.
+        public object RandomID { get; private set; } // Randomized ID.
 
         // dummy session data
         public MsnpSession(TcpServer server) : base(server) 
@@ -27,12 +29,21 @@ namespace MsnpServer
             Msnp = 0;
             Email = "unknown@email.com";
             ClientVersion = "0.0.0000";
-            SessionID = 0;
+            var randomNumber = new Random();
+            RandomID = randomNumber.Next(320000);
+            okay = RandomID;
         }
 
-        // why is this called a while after the client sends some shit?
-        protected override void OnConnected()
+        public long UnixTimeNow()
         {
+            var timeSpan = (DateTime.UtcNow - new DateTime(1970, 1, 1, 0, 0, 0));
+            return (long)timeSpan.TotalSeconds;
+        }
+
+        protected override void OnConnecting()
+        {
+            SessionID = -1;
+            ConnectTimeStamp = UnixTimeNow();
             Console.WriteLine($"MSNP TCP session with Id {Id} connected!");
 
             // Send invite message
@@ -53,23 +64,23 @@ namespace MsnpServer
             return id;
         }
 
-        protected void SendClient(string email, string[] command)
+        protected void SendClient(string email, string session, string[] command)
         {
             var server = (MsnpServer)Server; // required for GetSessionByEmail.
             Guid clientGuid = Guid.Empty;
             string inputEncoded = null;
-            string id = server.GetSessionByEmail(server, email, (string)SessionID);
+            string id = server.GetSessionByEmail(server, email, session);
             if (id == "00000000-0000-0000-0000-000000000000")
             {
                 Console.WriteLine("Error: GUID is invalid. Email: " + email);
             }
-            if (Guid.TryParse(id, out clientGuid))
+            else if (Guid.TryParse(id, out clientGuid))
             {
-                TcpSession session = server.FindSession(clientGuid);
+                TcpSession clientSession = server.FindSession(clientGuid);
                 string[] input = command;
                 inputEncoded = string.Join(" ", input) + "\r\n"; //msn uses newline
-                Console.WriteLine("Input (requested by another client): >>> " + inputEncoded);
-                session?.Send(inputEncoded);
+                Console.WriteLine("Input (requested by another client, to " + clientGuid + "): >>> " + inputEncoded);
+                clientSession?.SendAsync(inputEncoded);
             }
             else
             {
@@ -79,8 +90,12 @@ namespace MsnpServer
 
         protected override void OnReceived(byte[] buffer, long offset, long size)
         {
+            if (IsConnected == false)
+            {
+                Console.WriteLine("WOAH too early");
+            }
             string message = Encoding.UTF8.GetString(buffer, (int)offset, (int)size).Trim('\r', '\n'); // MSNP adds newlines, so trim that.
-            string clientInfo = "Info: " + Socket.RemoteEndPoint + ", MSNP" + Msnp + ", (Client version: " + ClientVersion + "), " + Email + ", " + Id; // info of the client
+            string clientInfo = "Info: " + Socket.RemoteEndPoint + ", Session ID " + SessionID + ", MSNP" + Msnp + ", (Client version: " + ClientVersion + "), " + Email + ", " + Id; // info of the client
             Console.WriteLine(clientInfo);
             Console.WriteLine("Input: >>> " + message);
 
@@ -113,7 +128,12 @@ namespace MsnpServer
                     switch (type) 
                     {
                         case "SB": // XFR [numb] SB [address] CKI [auth_string
-                            output = new string[] { "XFR", number, "SB", "127.0.0.1:1863", "CKI", "17262740.1050826919.32308" };
+                            output = new string[] { "XFR", number, "SB", "127.0.0.1:1863", "CKI", RandomID.ToString()};
+                            //int OldID = Convert.ToInt32(SessionID);
+                            //if (OldID == 0)
+                            //{
+                            //SessionID = RandomID.ToString(); // we're on switchboard, so use random SB number
+                            //}
                             break;
                     }
                     break;
@@ -122,6 +142,7 @@ namespace MsnpServer
                     break;
                 case "VER": // VER [numb] MSNP8 CVR0
                             // (some clients, like msn 4, report multiple MSNP versions. however, use the 1st listed one)
+                    SessionID = 0;
                     Msnp = Int32.Parse(input[2].Remove(0,4));
                     output = new string[] { "VER", number, "MSNP" + Msnp, "CVR0" };
                     break;
@@ -141,6 +162,7 @@ namespace MsnpServer
                     if (input[2].Contains("@")) //switchboard connection, pretty dumb.
                     {
                         Email = input[2];
+                        SessionID = input[3];
                         output = new string[] { "USR", number, "OK", input[2], "FriendlyName" }; // placeholder
                     }
                     else if (input[2] == "MD5") //md5 auth, msnp2-msn7
@@ -182,7 +204,7 @@ namespace MsnpServer
                     {
                         case "AL": // USR [numb] MD5 I [email]
                             output = new string[] { "ADD", number, "AL", "1", input[3], input[4] }; // placeholder
-                            SendClient(input[3], new string[] { "ADD", "0", "RL", "1", (string)Email, "Username" }); // sends invite to user if logged in
+                            SendClient(input[3], "0", new string[] { "ADD", "0", "RL", "1", (string)Email, "Username" }); // sends invite to user if logged in
                             break;
                         case "FL": // USR [numb] MD5 I [email]
                             output = new string[] { "ADD", number, "FL", "1", input[3], input[4], input[5] }; // placeholder
@@ -194,20 +216,27 @@ namespace MsnpServer
                     }
                     break;
                 case "CAL": // Invite someone to SB session.
-                    var randomNumber = new Random();
-                    string random = randomNumber.Next(15000).ToString();
-                    SessionID = random; // we're on switchboard, so use random SB number.
-                    SendClient(input[2], new string[] { "RNG", random, "127.0.0.1:1863", "CKI", "849102291.520491932", (string)Email, "UserName" });
-                    string sessionGUID = GetSession(input[2], random);
+                    SendClient(input[2], SessionID.ToString(), new string[] { "RNG", RandomID.ToString(), "127.0.0.1:1863", "CKI", "849102291.520491932", (string)Email, "UserName" });
+                    string sessionGUID = GetSession(input[2], SessionID.ToString());
+                    Console.WriteLine("GUID 1: " + input[2] + ", " + RandomID.ToString());
+                    Console.WriteLine("GUID 2: " + sessionGUID);
                     if (sessionGUID.Equals("00000000-0000-0000-0000-000000000000"))
                     {
                         output = new string[] { "217", number }; // account is non-existent/offline
                     }
                     else
                     {
-                        output = new string[] { "CAL", number, "RINGING", random }; // placeholder
+                        output = new string[] { "CAL", number, "RINGING", RandomID.ToString() }; // placeholder
                         //SendClient(input[2], new string[] { "ANS", "1", (string)Email, "849102291.520491932", random });
                     }
+                    break;
+                case "RNG": // Invited to SB session
+                    SessionID = RandomID;
+                    Console.WriteLine("Notice: the command '" + command + "' is not implemented");
+                    break;
+                case "ANS": // Accept invite to a SB session.
+                    Email = input[2];
+                    output = new string[] { "ANS", number, "\"OK\"" }; // placeholder
                     break;
                 default: // just awkwardly reuse input as output.
                     Console.WriteLine("Notice: the command '" + command + "' is not implemented");
@@ -219,7 +248,7 @@ namespace MsnpServer
             outputEncoded = string.Join(" ", output) + "\r\n"; //msn uses newline
             Console.WriteLine(clientInfo);
             Console.WriteLine("Output: <<< " + outputEncoded);
-            Send(outputEncoded);
+            SendAsync(outputEncoded);
 
             if (isDisconnecting == true)
             {
@@ -250,9 +279,8 @@ namespace MsnpServer
             List<string> allSessions = new List<string>();
             foreach (MsnpSession session in server.Sessions.Values)
             {
-                allSessions.Add($"{session.Email}:{session.SessionID}|{session.Id}");
+                allSessions.Add($"[CONNECTED {session.ConnectTimeStamp}] {session.Email}:{session.SessionID}|{session.Id}");
             }
-            Console.WriteLine(string.Join("\r\n", allSessions));
             return allSessions;
         }
 
@@ -263,12 +291,13 @@ namespace MsnpServer
             foreach (string line in sessions)
             {
                 string session = SessionID.ToString();
-                if (line.Contains(email) && line.Contains(session))
+                if (line.Contains(email + ":" + SessionID))
                 {
                     sessionGUID = line.Substring(line.IndexOf("|") + 1); // remove the email as we only need the GUID
                     break;
                 }
             }
+            Console.WriteLine(sessionGUID);
             return sessionGUID;
         }
 
@@ -311,7 +340,8 @@ namespace MsnpServer
                 string line = Console.ReadLine();
                 if (string.IsNullOrEmpty(line))
                 {
-                    Console.Write("GUID: " + server.GetSessionByEmail(server, "grkb@heelercrap.com", "0"));
+                    //Console.Write("GUID: " + server.GetSessionByEmail(server, "grkb@heelercrap.com", "0"));
+                    Console.WriteLine(string.Join("\r\n", server.GetSessions(server)));
                     //break;
                 }
 
